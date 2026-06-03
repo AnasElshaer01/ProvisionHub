@@ -80,3 +80,23 @@ class ConnectorCallORM(Base):
 # event_id, but the typical query joins events.user_id -> connector_calls.event_id.
 # The single-column indexes above already cover that path.
 Index("ix_connector_calls_event_attempt", ConnectorCallORM.event_id, ConnectorCallORM.attempt)
+
+
+class UserRemoteIdORM(Base):
+    """Per-(user, connector) mapping from our user_id to the downstream remote_id.
+
+    Why a table and not a column on users: keeps the canonical user free of
+    connector-specific fields (CLAUDE.md). Adding ServiceNow = one more row
+    per user, never a schema change.
+
+    Composite primary key — a user has at most one remote_id per connector.
+    Re-provisioning the same user against the same connector overwrites it
+    via UPSERT semantics in the repo (the only place this table is mutated).
+    """
+
+    __tablename__ = "user_remote_ids"
+
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), primary_key=True)
+    connector: Mapped[str] = mapped_column(String, primary_key=True)
+    remote_id: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow, nullable=False)
