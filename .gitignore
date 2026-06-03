@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# uv / poetry
+.uv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+provisionhub.db
+provisionhub.db-journal
+provisionhub.db-wal
+provisionhub.db-shm
+*.sqlite
+*.sqlite3
+.env
+.env.local
