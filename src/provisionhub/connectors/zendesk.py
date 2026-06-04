@@ -1,6 +1,6 @@
 """Zendesk REST API v2 connector.
 
-Provisions users in Zendesk via REST API v2. Auth is OAuth Bearer token.
+Provisions users in Zendesk via REST API v2. Auth is HTTP Basic (email/token:api_token).
 Idempotency: lookup by email before create.
 
 Zendesk user operations:
@@ -20,19 +20,18 @@ from .base import Connector
 class ZendeskConnector(Connector):
     name = "zendesk"
 
-    def __init__(self, subdomain: str, oauth_token: str) -> None:
+    def __init__(self, subdomain: str, email: str, api_token: str) -> None:
         """Create a Zendesk connector.
 
         Args:
             subdomain: Zendesk subdomain (e.g., "yourcompany" from yourcompany.zendesk.com)
-            oauth_token: OAuth Bearer token (access_token from Zendesk OAuth flow)
+            email: Zendesk admin email
+            api_token: API token (from Admin → Apps & Integrations → API Tokens)
         """
         self._client = httpx.AsyncClient(
             base_url=f"https://{subdomain}.zendesk.com",
-            headers={
-                "Authorization": f"Bearer {oauth_token}",
-                "Content-Type": "application/json",
-            },
+            auth=httpx.BasicAuth(f"{email}/token", api_token),
+            headers={"Content-Type": "application/json"},
         )
 
     async def create_user(self, user: User) -> str:

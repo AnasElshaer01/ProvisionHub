@@ -36,10 +36,11 @@ def create_app() -> FastAPI:
             email=settings.jira_email,
             token=settings.jira_api_token,
         ))
-    if settings.zendesk_subdomain and settings.zendesk_oauth_token:
+    if settings.zendesk_subdomain and settings.zendesk_email and settings.zendesk_api_token:
         registry.register(ZendeskConnector(
             subdomain=settings.zendesk_subdomain,
-            oauth_token=settings.zendesk_oauth_token,
+            email=settings.zendesk_email,
+            api_token=settings.zendesk_api_token,
         ))
 
     service = ProvisioningService(session_factory=SessionLocal, registry=registry)
