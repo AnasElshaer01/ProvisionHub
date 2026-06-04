@@ -22,6 +22,8 @@ class Settings(BaseSettings):
     jira_base_url: str = ""
     jira_email: str = ""
     jira_api_token: str = ""
+    zendesk_subdomain: str = ""
+    zendesk_oauth_token: str = ""
 
 
 settings = Settings()

@@ -18,6 +18,7 @@ from .api import scim_users
 from .api.middleware import CorrelationIdMiddleware
 from .config import settings
 from .connectors.jira import JiraConnector
+from .connectors.zendesk import ZendeskConnector
 from .connectors.registry import ConnectorRegistry
 from .db.session import SessionLocal
 from .provisioning.queue import JobQueue
@@ -34,6 +35,11 @@ def create_app() -> FastAPI:
             base_url=settings.jira_base_url,
             email=settings.jira_email,
             token=settings.jira_api_token,
+        ))
+    if settings.zendesk_subdomain and settings.zendesk_oauth_token:
+        registry.register(ZendeskConnector(
+            subdomain=settings.zendesk_subdomain,
+            oauth_token=settings.zendesk_oauth_token,
         ))
 
     service = ProvisioningService(session_factory=SessionLocal, registry=registry)
