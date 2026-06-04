@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     slack_token: str = ""
     jira_base_url: str = ""
     jira_email: str = ""
-    jira_token: str = ""
+    jira_api_token: str = ""
 
 
 settings = Settings()

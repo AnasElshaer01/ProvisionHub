@@ -29,11 +29,11 @@ def create_app() -> FastAPI:
     # one registry.register(...) line per connector (CLAUDE.md recipe).
     registry = ConnectorRegistry()
     # registry.register(SlackConnector(token=settings.slack_token))
-    if settings.jira_base_url and settings.jira_email and settings.jira_token:
+    if settings.jira_base_url and settings.jira_email and settings.jira_api_token:
         registry.register(JiraConnector(
             base_url=settings.jira_base_url,
             email=settings.jira_email,
-            token=settings.jira_token,
+            token=settings.jira_api_token,
         ))
 
     service = ProvisioningService(session_factory=SessionLocal, registry=registry)
