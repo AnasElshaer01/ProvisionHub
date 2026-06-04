@@ -11,7 +11,10 @@ from fastapi import FastAPI
 
 from .api import scim_users
 from .api.middleware import CorrelationIdMiddleware
+from .connectors.registry import ConnectorRegistry
+from .db.session import SessionLocal
 from .provisioning.queue import JobQueue
+from .provisioning.service import ProvisioningService
 
 
 def create_app() -> FastAPI:
@@ -20,8 +23,14 @@ def create_app() -> FastAPI:
     # Correlation-ID middleware runs before routes; routes read it off request.state.
     app.add_middleware(CorrelationIdMiddleware)
 
-    # The JobQueue singleton. Service will be wired in here on Day 2.
-    queue = JobQueue(service=None)
+    # Wire the pipeline. Registry is empty for v1 — adding Slack/Jira is
+    # one registry.register(...) line per connector (CLAUDE.md recipe).
+    registry = ConnectorRegistry()
+    # registry.register(SlackConnector(token=settings.slack_token))
+    # registry.register(JiraConnector(base_url=settings.jira_base_url, token=settings.jira_token))
+
+    service = ProvisioningService(session_factory=SessionLocal, registry=registry)
+    queue = JobQueue(service=service)
     app.dependency_overrides[scim_users.get_queue] = lambda: queue
 
     app.include_router(scim_users.router)

@@ -93,6 +93,12 @@ async def create_user(
         payload=payload,
     )
 
+    # Commit BEFORE submitting. The service opens its own session to load
+    # the user; that session can only see committed data. (This also makes
+    # the audit row durable before any background worker starts — switching
+    # to the async-queue mode later doesn't change correctness here.)
+    await session.commit()
+
     await queue.submit(ProvisioningJob(
         event_id=event_id,
         correlation_id=request.state.correlation_id,
@@ -100,7 +106,6 @@ async def create_user(
         op="create",
     ))
 
-    await session.commit()
     return to_scim(created)
 
 
