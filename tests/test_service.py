@@ -243,3 +243,54 @@ async def test_partial_failure_other_connectors_still_run(session_factory):
         )).scalars().all()
         assert len(recording_calls) == 1
         assert recording_calls[0].succeeded is True
+
+
+# ===========================================================================
+# 4. Concurrency — Slack and Jira run AT THE SAME TIME
+# ===========================================================================
+
+class SlowConnector(Connector):
+    """Sleeps `delay_s` on create_user, then succeeds. For timing tests."""
+
+    def __init__(self, name: str, delay_s: float) -> None:
+        # Connector ABC uses `name` as a class attr; assign per-instance.
+        self.name = name
+        self.delay_s = delay_s
+
+    async def create_user(self, user: User) -> str:
+        import asyncio
+        await asyncio.sleep(self.delay_s)
+        return f"remote-{self.name}-{user.user_name}"
+
+    async def update_user(self, remote_id: str, user: User) -> None: ...
+    async def deactivate_user(self, remote_id: str) -> None: ...
+
+
+@pytest.mark.asyncio
+async def test_connectors_run_concurrently(session_factory):
+    """Two connectors that each sleep 100ms must finish in <180ms wall-clock.
+    If anyone reverts the gather() back to a sequential for-loop, this fails
+    (sequential would be ~200ms+)."""
+    import asyncio
+    import time as _time
+
+    job = await _seed_user_and_event(session_factory)
+
+    slack = SlowConnector(name="slack-fake", delay_s=0.1)
+    jira = SlowConnector(name="jira-fake", delay_s=0.1)
+    registry = ConnectorRegistry()
+    registry.register(slack)
+    registry.register(jira)
+    service = ProvisioningService(session_factory=session_factory, registry=registry)
+
+    start = _time.perf_counter()
+    await service.run(job)
+    elapsed = _time.perf_counter() - start
+
+    assert elapsed < 0.18, f"expected <180ms (parallel), got {elapsed*1000:.0f}ms"
+
+    # Both succeeded, both have remote_ids.
+    async with session_factory() as s:
+        remotes = (await s.execute(select(UserRemoteIdORM))).scalars().all()
+        names = sorted(r.connector for r in remotes)
+        assert names == ["jira-fake", "slack-fake"]

@@ -26,7 +26,6 @@ from .provisioning.service import ProvisioningService
 
 
 def create_app() -> FastAPI:
-    # Wire the pipeline. Registry is empty for v1 — adding Slack/Jira is
     # one registry.register(...) line per connector (CLAUDE.md recipe).
     registry = ConnectorRegistry()
     # registry.register(SlackConnector(token=settings.slack_token))
@@ -41,6 +40,7 @@ def create_app() -> FastAPI:
             subdomain=settings.zendesk_subdomain,
             email=settings.zendesk_email,
             api_token=settings.zendesk_api_token,
+            org_id=settings.zendesk_org_id,
         ))
 
     service = ProvisioningService(session_factory=SessionLocal, registry=registry)

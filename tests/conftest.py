@@ -6,6 +6,11 @@ migration is independently smoke-tested via `alembic upgrade head`).
 The engine uses StaticPool so all sessions in a test share the same
 in-memory database — the service opens its own session and must see
 what the route's session wrote.
+
+The `client` fixture drives the app's lifespan via `asgi-lifespan`'s
+`LifespanManager` so the JobQueue background worker actually starts
+and stops around each test. Without this, `await queue.submit(job)`
+would silently park the job on a queue that nobody is consuming.
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 import pytest_asyncio
+from asgi_lifespan import LifespanManager
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
@@ -49,9 +55,11 @@ async def session(session_factory) -> AsyncIterator[AsyncSession]:
 
 @pytest_asyncio.fixture
 async def client(session_factory) -> AsyncIterator[AsyncClient]:
-    """FastAPI client with the in-memory DB injected.
+    """FastAPI client with the in-memory DB injected and lifespan driven.
 
     Re-imports `create_app` per-test so dependency_overrides don't leak.
+    `LifespanManager` runs startup (queue worker spawn) and shutdown
+    (poison pill + drain) around the body of the fixture.
     """
     from provisionhub.main import create_app
 
@@ -67,6 +75,7 @@ async def client(session_factory) -> AsyncIterator[AsyncClient]:
 
     app.dependency_overrides[get_session] = _override_get_session
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://testserver") as c:
-        yield c
+    async with LifespanManager(app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://testserver") as c:
+            yield c

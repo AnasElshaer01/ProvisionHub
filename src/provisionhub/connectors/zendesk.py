@@ -20,14 +20,17 @@ from .base import Connector
 class ZendeskConnector(Connector):
     name = "zendesk"
 
-    def __init__(self, subdomain: str, email: str, api_token: str) -> None:
+    def __init__(self, subdomain: str, email: str, api_token: str, org_id: str = "") -> None:
         """Create a Zendesk connector.
 
         Args:
             subdomain: Zendesk subdomain (e.g., "yourcompany" from yourcompany.zendesk.com)
             email: Zendesk admin email
             api_token: API token (from Admin → Apps & Integrations → API Tokens)
+            org_id: Optional Zendesk organization id. When set, created users are
+                attached to this organization. Unset → users land with no org.
         """
+        self._org_id = org_id
         self._client = httpx.AsyncClient(
             base_url=f"https://{subdomain}.zendesk.com",
             auth=httpx.BasicAuth(f"{email}/token", api_token),
@@ -69,16 +72,17 @@ class ZendeskConnector(Connector):
         else:
             name = user.user_name
 
-        # Create the user. End-users are the default role for provisioning.
+        user_payload = {
+            "name": name,
+            "email": email,
+            "role": "agent",
+        }
+        if self._org_id:
+            user_payload["organization_id"] = int(self._org_id)
+
         create_resp = await self._client.post(
             "/api/v2/users.json",
-            json={
-                "user": {
-                    "name": name,
-                    "email": email,
-                    "role": "end-user",
-                }
-            },
+            json={"user": user_payload},
         )
         create_resp.raise_for_status()
         return str(create_resp.json()["user"]["id"])

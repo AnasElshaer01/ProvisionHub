@@ -2,7 +2,7 @@
 
 Snapshot of where the codebase is, what's tested, what's deferred, and what to do next. Read this together with `PLAN.md` (scope / architecture) and `CLAUDE.md` (conventions).
 
-Last updated: 2026-06-04 — end of Commit B.
+Last updated: 2026-06-04 — background worker + parallel connector fan-out shipped.
 
 ---
 
@@ -42,13 +42,19 @@ e271f8e feat: ProvisioningService closes the queue seam end-to-end
 
 ```
 SCIM POST  →  route writes users + provisioning_events  →  commit
-            →  queue.submit(job)
+            →  queue.submit(job)            ← puts on asyncio.Queue, returns
+            →  route returns 201 to Entra (ms)
+                              .
+                              .  (background)
+            →  worker pulls job
             →  service.run(job) opens its own session
-            →  for connector in registry.enabled():       ← empty in v1
-                  outcomes = run_with_retry(connector.op(user))
-                  one connector_calls row per outcome
+            →  asyncio.gather over registry.enabled():    ← parallel across connectors
+                  per connector: run_with_retry(connector.op(user))
+                  one connector_calls row per HTTP attempt
                   upsert user_remote_ids on create-success
-            →  partial failure: log + continue, audit row has succeeded=false
+            →  per-connector failure: connector.exhausted ERROR log
+            →  always: job.complete INFO log (outcome=success|partial|failure
+                                              connectors=slack:ok,jira:failed)
 ```
 
 ### Architectural seams (locked by tests)
@@ -56,16 +62,17 @@ SCIM POST  →  route writes users + provisioning_events  →  commit
 | seam | what's locked | test |
 |---|---|---|
 | Route → queue | route never calls `service.run` directly | `tests/test_queue.py::test_route_calls_queue_submit_not_service_directly` |
-| Queue → service | `submit()` forwards to `service.run` once | `tests/test_queue.py::test_submit_forwards_to_service_run_once` |
-| Queue tolerates no service | day-1 path doesn't crash with `service=None` | `tests/test_queue.py::test_submit_is_noop_when_service_is_none` |
+| Queue → service | `submit()` reaches `service.run` via the worker exactly once | `tests/test_queue.py::test_submit_routes_through_worker_to_service_run_once` |
+| Worker resilience | one bad job doesn't kill the worker loop | `tests/test_queue.py::test_worker_survives_a_failing_job` |
 | Service ↔ registry | service handles an unknown connector identically | `tests/test_service.py::test_service_handles_unknown_connector_identically` |
 | Retry → audit | one `connector_calls` row per HTTP attempt | `tests/test_service.py::test_service_writes_one_call_row_per_retry_attempt` |
 | Partial failure | one connector failing doesn't stop others | `tests/test_service.py::test_partial_failure_other_connectors_still_run` |
+| Concurrent fan-out | connectors run at the same time, not sequentially | `tests/test_service.py::test_connectors_run_concurrently` |
 
 ### Test suite
 
 ```
-pytest -q  →  6 passed in 0.38s
+pytest -q  →  7 passed in 0.52s
 ```
 
 Retry tests use a monkeypatched `DEFAULT_BACKOFFS_S = (0, 0, 0)` (late-bound via `from . import retry as _retry`); production still uses (1s, 4s, 16s).
@@ -99,9 +106,11 @@ src/provisionhub/
 │   └── scim.py                      SCIMUser/Name/Email + SCIMPatchOp + canonicalize()
 └── provisioning/
     ├── job.py                       ProvisioningJob (event_id, correlation_id, user_id, op)
-    ├── queue.py                     JobQueue — inline MODE 1 (active); MODE 2 worker (commented)
+    ├── queue.py                     JobQueue — submit() puts on asyncio.Queue;
+    │                                 _worker() consumes; start/stop via lifespan
     ├── retry.py                     run_with_retry, AttemptOutcome (with latency_ms), is_retriable
-    └── service.py                   ProvisioningService.run — the orchestrator
+    └── service.py                   ProvisioningService.run — orchestrator;
+                                      asyncio.gather across connectors (parallel)
 
 alembic/
 ├── env.py                           render_as_batch=True, async engine
@@ -126,9 +135,10 @@ scripts/
 2. **SCIM PATCH `op` accepts mixed case** — Entra capitalizes (`Replace`). SCIM spec says case-insensitive.
 3. **`emails` stored as JSON column** on `users`. No separate `emails` table. Tradeoff: no SQL filter by email. Acceptable for v1.
 4. **Repositories don't commit.** Callers (route, service) own the transaction so multi-table writes stay atomic.
-5. **Route commits BEFORE `queue.submit`.** The service's session can only see committed data. Also makes the path correct under MODE 2 (background worker) with zero further changes.
-6. **`JobQueue` ships two modes.** MODE 1 (inline) active. MODE 2 (asyncio.Queue + `_worker` loop) commented in place — flip by uncommenting and adding lifespan glue.
-7. **Three-method connector ABC.** Service maps SCIM `patch` → `update_user`. No fourth method.
+5. **Route commits BEFORE `queue.submit`.** The service's session can only see committed data. Since the service runs in a background worker, the route MUST commit before submitting or the worker would query against an empty transaction.
+6. **`JobQueue` runs a background worker.** `submit()` puts the job on an `asyncio.Queue` and returns immediately; one worker task (spawned by the FastAPI lifespan) pulls jobs and calls `service.run`. Real broker (Redis/SQS) is the next swap behind the same `submit(job)` signature.
+7. **Connectors run concurrently per job.** `ProvisioningService.run` calls `asyncio.gather` across the registry with `return_exceptions=True`. Each connector still does its own 3-attempt retry. Audit writes are serialized via an `asyncio.Lock` because the shared SQLAlchemy async session is single-consumer; the slow HTTP work is what's parallel.
+8. **Three-method connector ABC.** Service maps SCIM `patch` → `update_user`. No fourth method.
 8. **Update fallthrough → create.** If `op=update` arrives and we have no `remote_id` for that connector, run `create_user`. Self-healing for transient failures during initial provisioning.
 9. **Partial failure preserved.** Connector failing after retries doesn't stop the rest. `connector_calls.succeeded=false` is the audit signal.
 10. **`remote_id` lives in its own `user_remote_ids` table.** Composite PK (user_id, connector). Adding ServiceNow = rows, not schema.
@@ -143,7 +153,8 @@ scripts/
 ## Documented gaps (intentional)
 
 - Groups (`/Groups`), ETag/`If-Match`, multi-tenant (`tenant_id`).
-- Real broker behind `JobQueue` (the seam is ready; MODE 2 is the in-process bridge).
+- Real broker behind `JobQueue` (the in-process `asyncio.Queue` is the bridge; swap to Redis/SQS is a body change in `queue.py`).
+- Across-job parallelism (multiple background workers). Today one worker pulls; within-job fan-out across connectors is already parallel. Spawning N workers is one line in `JobQueue.start`.
 - SCIM Bulk, complex filters (only `userName eq "x"` honored).
 - Secrets manager — env vars only.
 - `displayName`, `title`, enterprise extension URN — accepted via `extra="allow"`, not mapped.
@@ -213,17 +224,17 @@ Jira does NOT speak SCIM for users (Cloud has a SCIM endpoint but it's enterpris
 - `demo.http` file with the 5-minute demo sequence from `PLAN.md §10`.
 - README updates.
 
-### 6. (Optional, last) Flip to MODE 2
-Uncomment async-queue body + `start`/`stop` in `provisioning/queue.py`, add FastAPI lifespan in `main.py`. Tests still pass — that's the whole point of the seam.
+### 6. Real broker (later)
+Replace `asyncio.Queue` with Redis/SQS in `provisioning/queue.py`. The `submit(job)` signature, route, service, and connectors do not change. Adds durability across restarts and across-process scale-out.
 
 ---
 
 ## Known-not-broken oddities
 
-- **`tests/conftest.py::client`** re-imports `create_app` per test to avoid override leakage. If you ever see tests interfering, check that import is still happening per-fixture.
+- **`tests/conftest.py::client`** re-imports `create_app` per test to avoid override leakage AND wraps the client in `LifespanManager` so the background worker actually starts under `ASGITransport`. If integration tests start hanging on `queue.submit`, that's the first thing to check.
 - **Idempotent re-POST returns 200** but the route's decorator says 201; we explicitly use `JSONResponse(status_code=200, ...)` for that one branch. Don't "simplify" by removing the JSONResponse.
 - **`service.py` imports** `from . import retry as _retry`, not `from .retry import run_with_retry`. This is deliberate so `monkeypatch.setattr("provisionhub.provisioning.retry.DEFAULT_BACKOFFS_S", ...)` reaches it.
-- **Async session is single-consumer**. Don't `asyncio.gather` repo calls on one session — give each concurrent task its own session.
+- **Async session is single-consumer**. The service's connector fan-out is via `asyncio.gather`, but `connector_calls` writes are taken under an `asyncio.Lock` for exactly this reason. Don't strip the lock to "simplify" the fan-out.
 
 ---
 
@@ -231,6 +242,6 @@ Uncomment async-queue body + `start`/`stop` in `provisioning/queue.py`, add Fast
 
 1. Read this file.
 2. `git log --oneline` — confirms you're at `e271f8e` (or later).
-3. `pytest -q` — should be 6/6 in <1s. If not, something broke since this snapshot was written.
+3. `pytest -q` — should be 7/7 in <1s. If not, something broke since this snapshot was written.
 4. Pick a "Next steps" item; usually #1 (Slack).
 5. Use the same commit cadence: plan → code → smoke → one descriptive commit per logical chunk.

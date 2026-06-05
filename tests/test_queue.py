@@ -1,11 +1,12 @@
 """Queue seam — pinned from both sides.
 
-Top half: unit test that JobQueue.submit forwards to service.run.
+Top half: unit tests that JobQueue.submit eventually invokes service.run
+through the background worker, and that one bad job doesn't kill the loop.
 Bottom half: integration test that the SCIM route calls queue.submit,
 not service.run directly.
 
 If anyone "simplifies" the route by skipping the queue, the bottom test
-fails. If anyone replaces submit with a no-op, the top test fails.
+fails. If anyone replaces submit with a no-op, the top tests fail.
 """
 
 from __future__ import annotations
@@ -20,24 +21,41 @@ from provisionhub.provisioning.queue import JobQueue
 
 
 @pytest.mark.asyncio
-async def test_submit_forwards_to_service_run_once():
+async def test_submit_routes_through_worker_to_service_run_once():
+    """submit -> queue -> worker -> service.run. Exactly once per submission."""
     fake_service = AsyncMock()
     queue = JobQueue(service=fake_service)
     job = ProvisioningJob(event_id="e1", correlation_id="c1", user_id="u1", op="create")
 
-    await queue.submit(job)
+    await queue.start()
+    try:
+        await queue.submit(job)
+        # Wait for the worker to drain the queue before asserting.
+        await queue._queue.join()
+    finally:
+        await queue.stop()
 
     fake_service.run.assert_awaited_once_with(job)
 
 
 @pytest.mark.asyncio
-async def test_submit_is_noop_when_service_is_none():
-    """The Day-1 path: JobQueue may be wired before the service exists.
-    submit must not blow up — it just logs and returns."""
-    queue = JobQueue(service=None)
-    job = ProvisioningJob(event_id="e1", correlation_id="c1", user_id="u1", op="create")
+async def test_worker_survives_a_failing_job():
+    """A connector blowing up must not kill the worker. The next job still runs."""
+    fake_service = AsyncMock()
+    fake_service.run.side_effect = [RuntimeError("downstream on fire"), None]
+    queue = JobQueue(service=fake_service)
+    job1 = ProvisioningJob(event_id="e1", correlation_id="c1", user_id="u1", op="create")
+    job2 = ProvisioningJob(event_id="e2", correlation_id="c2", user_id="u2", op="create")
 
-    await queue.submit(job)  # asserts no exception
+    await queue.start()
+    try:
+        await queue.submit(job1)
+        await queue.submit(job2)
+        await queue._queue.join()
+    finally:
+        await queue.stop()
+
+    assert fake_service.run.await_count == 2
 
 
 @pytest.mark.asyncio

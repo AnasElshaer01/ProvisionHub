@@ -1,24 +1,37 @@
-"""JobQueue — the architectural seam.
+"""JobQueue — the architectural seam between "accept" and "process".
 
 The SCIM route always calls `queue.submit(job)`. It never calls the service
-directly. The body of `submit` is the only thing that changes when we go
-from inline -> in-process async queue -> Redis broker.
+directly. The route returns 201 to Entra in milliseconds; the work — calling
+out to Slack, Jira, retrying flaky downstreams — happens in a background
+worker on the same event loop.
 
-This file ships TWO modes:
+Shape:
 
-  1. INLINE (active, default)
-     submit() awaits service.run(job) right there in the request handler.
-     Simple, fast to demo, no background tasks. The Day 1 default.
+    submit(job)  ──► asyncio.Queue ──► _worker() ──► service.run(job)
+       ▲                                  ▲
+       │                                  │
+    fast: returns                    long: HTTP fan-out + retries
+    immediately                      (parallel across connectors)
 
-  2. IN-PROCESS ASYNC QUEUE (commented out)
-     submit() puts the job on an asyncio.Queue and returns immediately.
-     A background worker task pulls jobs and runs them. The route is no
-     longer waiting on connector latency. Uncomment the marked block and
-     wire `await queue.start()` / `await queue.stop()` in main.py lifespan.
+Lifecycle:
 
-  3. (Future) REAL BROKER
-     submit() would push onto Redis/SQS; a separate worker process pulls
-     and calls service.run. Same `submit(job)` signature — route doesn't know.
+  - `start()` spawns the background worker. Called once from FastAPI
+    lifespan on startup.
+  - `stop()` puts a poison-pill sentinel on the queue and awaits the
+    worker draining. Called once from FastAPI lifespan on shutdown.
+
+Single consumer task. One job is dispatched at a time; per-job parallelism
+(across connectors) lives inside `ProvisioningService.run` via
+`asyncio.gather`. If you need across-job parallelism later, spawn N workers
+in `start()` — `asyncio.Queue` is N-consumer safe and `service.run` opens
+its own session per job.
+
+Durability: the queue is in-process. If the process dies with jobs queued,
+those jobs are lost. The `provisioning_events` row was committed by the
+route before submit, so the inbound audit is durable; only the outbound
+attempts are lost. Closing this gap is what a real broker (Redis/SQS) is
+for — and the seam is `submit(job)` itself, so swapping the broker in
+later means changing the body of this file and nothing else.
 """
 
 from __future__ import annotations
@@ -35,67 +48,57 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-class JobQueue:
-    def __init__(self, service: "ProvisioningService | None" = None):
-        self._service = service
+# Sentinel placed on the queue by stop() to tell the worker to exit cleanly.
+_SHUTDOWN: object = object()
 
-        # ---- async-queue mode state (only used if you uncomment below) ----
-        self._queue: asyncio.Queue[ProvisioningJob | None] = asyncio.Queue()
+
+class JobQueue:
+    def __init__(self, service: "ProvisioningService"):
+        self._service = service
+        self._queue: asyncio.Queue = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
 
-    # =========================================================================
-    # submit() — the seam. Pick ONE of the two bodies below.
-    # =========================================================================
+    # ------------------------------------------------------------------ submit
     async def submit(self, job: ProvisioningJob) -> None:
+        """Enqueue a job for the background worker. Returns immediately."""
         log.info(
             "queue.submit event_id=%s correlation_id=%s op=%s user_id=%s",
             job.event_id, job.correlation_id, job.op, job.user_id,
         )
+        await self._queue.put(job)
 
-        # --- MODE 1: INLINE (active) ----------------------------------------
-        # The route waits for the service to finish before returning.
-        if self._service is not None:
-            await self._service.run(job)
+    # --------------------------------------------------------------- lifecycle
+    async def start(self) -> None:
+        """Spawn the background worker. Called from FastAPI lifespan startup."""
+        if self._worker_task is None:
+            self._worker_task = asyncio.create_task(self._worker(), name="job-queue-worker")
+            log.info("queue worker started")
 
-        # --- MODE 2: ASYNC QUEUE (uncomment to enable, comment out MODE 1) --
-        # await self._queue.put(job)
-        # # submit returns now; the worker below will pick the job up.
+    async def stop(self) -> None:
+        """Drain in-flight jobs and stop the worker. Called from lifespan shutdown."""
+        if self._worker_task is None:
+            return
+        await self._queue.put(_SHUTDOWN)
+        await self._worker_task
+        self._worker_task = None
+        log.info("queue worker stopped")
 
-    # =========================================================================
-    # Worker loop — only runs in MODE 2. Lifecycle methods called from main.py.
-    # Uncomment everything below to switch to background-worker processing.
-    # =========================================================================
-    # async def start(self) -> None:
-    #     """Spawn the background worker. Call from FastAPI lifespan startup."""
-    #     if self._worker_task is None:
-    #         self._worker_task = asyncio.create_task(self._worker())
-    #         log.info("queue worker started")
-    #
-    # async def stop(self) -> None:
-    #     """Drain in-flight jobs and stop the worker. Call from lifespan shutdown."""
-    #     await self._queue.put(None)  # poison pill
-    #     if self._worker_task is not None:
-    #         await self._worker_task
-    #         self._worker_task = None
-    #     log.info("queue worker stopped")
-    #
-    # async def _worker(self) -> None:
-    #     """Pull jobs off the queue and run them, one at a time.
-    #
-    #     Single-consumer loop. If you want concurrency, spawn N of these
-    #     in start() and they'll fan out across the same queue safely.
-    #     """
-    #     while True:
-    #         job = await self._queue.get()
-    #         if job is None:  # poison pill from stop()
-    #             self._queue.task_done()
-    #             break
-    #         try:
-    #             if self._service is not None:
-    #                 await self._service.run(job)
-    #         except Exception:
-    #             # Don't let one bad job kill the worker. The connector_calls
-    #             # row written by the service already records the failure.
-    #             log.exception("job failed event_id=%s", job.event_id)
-    #         finally:
-    #             self._queue.task_done()
+    # ------------------------------------------------------------------ worker
+    async def _worker(self) -> None:
+        """Pull jobs off the queue and run them, one at a time.
+
+        One bad job must not kill the loop. The connector_calls row written
+        by the service already records the failure; we log at exception
+        level and move on so the next job still runs.
+        """
+        while True:
+            item = await self._queue.get()
+            try:
+                if item is _SHUTDOWN:
+                    return
+                try:
+                    await self._service.run(item)
+                except Exception:
+                    log.exception("job failed event_id=%s", item.event_id)
+            finally:
+                self._queue.task_done()

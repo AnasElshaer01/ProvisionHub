@@ -25,16 +25,18 @@ FastAPI route
    │  4. JobQueue.submit(job)        ◀── the queue seam
    ▼
 JobQueue.submit(job)
-   │  v1: calls service.run inline (loop)
-   │  v2: would push to Redis; a worker pulls and calls service.run
-   ▼
+   │  puts job on asyncio.Queue, returns immediately
+   │  (next swap: push to Redis/SQS; route + service untouched)
+   ▼  (background worker, started by FastAPI lifespan)
 ProvisioningService.run(job)
-   │  for each connector in registry:
-   │     try connector.<op>(user) with retry (3 attempts: 1s, 4s, 16s)
-   │     write connector_calls row per attempt
+   │  asyncio.gather across registry.enabled():       ◀── parallel
+   │     per connector: run_with_retry(connector.<op>(user))   (3 attempts: 1s, 4s, 16s)
+   │     write connector_calls row per attempt (audit writes under asyncio.Lock)
+   │  → connector.exhausted log per failed connector
+   │  → job.complete log line: outcome=success|partial|failure connectors=slack:ok,jira:failed
    ▼
-ConnectorRegistry ──▶ SlackConnector ──▶ Slack API
-                  ──▶ JiraConnector  ──▶ Jira API
+ConnectorRegistry ──▶ SlackConnector ──▶ Slack API   ┐ both at once
+                  ──▶ JiraConnector  ──▶ Jira API    ┘
                   ──▶ (ServiceNowConnector — one new file + one register line)
 ```
 
@@ -48,7 +50,7 @@ Two interfaces carry the design: **`JobQueue`** (decouples receive from process)
 - **Bearer-token auth**
 - **Canonical `User`** + SCIM ↔ canonical mapping
 - **`ProvisioningJob`** dataclass — work as data
-- **`JobQueue`** — real class, inline v1 body
+- **`JobQueue`** — real class, in-process `asyncio.Queue` + background worker (lifecycle via FastAPI lifespan)
 - **`ProvisioningService`** — iterates registry with retry, writes audit per attempt
 - **`Connector` ABC** + **`ConnectorRegistry`**
 - **`SlackConnector`** and **`JiraConnector`** — real httpx code, respx-mocked tests
@@ -95,21 +97,42 @@ SQLAlchemy's portable `JSON` type maps to SQLite `JSON` (TEXT) and Postgres `JSO
 # provisioning/queue.py
 class JobQueue:
     """The seam between 'a job was created' and 'a job got processed.'
-    v1: runs inline (loop). v2: push to Redis; a worker calls service.run."""
+
+    Today: in-process asyncio.Queue + a single background worker task.
+    Tomorrow: push to Redis/SQS; a worker process pulls and calls service.run.
+    Same submit() signature either way."""
 
     def __init__(self, service: "ProvisioningService"):
         self._service = service
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._worker_task: asyncio.Task | None = None
 
     async def submit(self, job: ProvisioningJob) -> None:
-        # v1: inline — fast to build, easy to demo, no broker dependency.
-        # v2: push job onto Redis/SQS/Postgres queue and return immediately.
-        #     A separate worker process would pull and call self._service.run(job).
-        await self._service.run(job)
+        await self._queue.put(job)         # returns in microseconds
+
+    async def start(self) -> None:         # called from FastAPI lifespan
+        self._worker_task = asyncio.create_task(self._worker())
+
+    async def stop(self) -> None:          # called from FastAPI lifespan
+        await self._queue.put(_SHUTDOWN)
+        await self._worker_task
+
+    async def _worker(self) -> None:
+        while True:
+            item = await self._queue.get()
+            if item is _SHUTDOWN:
+                return
+            try:
+                await self._service.run(item)
+            except Exception:
+                log.exception("job failed event_id=%s", item.event_id)
+            finally:
+                self._queue.task_done()
 ```
 
-The SCIM route never calls `ProvisioningService` directly — it calls `queue.submit(job)`. Async-vs-sync is later a **body change in one class**, no callsite changes.
+The SCIM route never calls `ProvisioningService` directly — it calls `queue.submit(job)`. Swapping the in-process queue for Redis is a **body change in one class**; the route, service, and connectors do not change.
 
-`test_queue.py` pins this seam: it asserts `submit` invokes `service.run` exactly once with the right job.
+`test_queue.py` pins this seam: it asserts a submitted job reaches `service.run` exactly once through the worker, and that a single failing job doesn't kill the worker.
 
 ---
 
@@ -137,8 +160,14 @@ registry.register(JiraConnector(base_url=settings.jira_url, token=settings.jira_
 # provisioning/service.py — never names a connector
 async def run(self, job: ProvisioningJob) -> None:
     user = await self.users.get(job.user_id)
-    for connector in self.registry.enabled():
-        await self._invoke_with_retry(connector, job, user)
+    connectors = list(self.registry.enabled())
+    db_lock = asyncio.Lock()                                   # audit writes serialized
+    results = await asyncio.gather(                            # HTTP runs in parallel
+        *[self._dispatch(c, job, user, db_lock) for c in connectors],
+        return_exceptions=True,
+    )
+    # one log line summarizing per-connector outcomes
+    log.info("job.complete event_id=%s outcome=%s connectors=%s", ...)
 ```
 
 **Add-a-connector recipe (in README, verbatim):**
@@ -234,7 +263,7 @@ provisionhub/
 4. `PATCH active=false` → second inbound event, two more outbound rows showing deactivation
 5. Open `connectors/jira.py` → walk the mapping. *"This is why the canonical user exists — Jira's shape is nothing like Slack's."*
 6. Open `provisioning/service.py` → *"This service never names a connector. It loops the registry. Adding ServiceNow = one new file in `connectors/` + one register line in `main.py`."*
-7. Open `provisioning/queue.py` → *"The SCIM route never calls the service directly — it submits a job to this `JobQueue`. Today the body runs the job inline. Swapping to Redis is a body change: push the job, let a worker pull and call `service.run`. Route, service, connectors — none change."*
+7. Open `provisioning/queue.py` → *"The SCIM route never calls the service directly — it submits a job to this `JobQueue`. `submit()` puts the job on an in-process queue and returns; a background worker — started by the FastAPI lifespan — pulls jobs and runs them. That's why the POST returns in milliseconds even if Slack is slow. Swapping the in-process queue for Redis is a body change in this file. Route, service, connectors — none change."*
 8. Open `tests/test_service.py` → *"Fake connector registered at runtime. Service handles it identically. Proof, not claim."*
 9. Open `db/orm.py` → *"SQLite via SQLAlchemy async. JSON columns are portable. Postgres swap is a connection-string change — the ORM is backend-agnostic."*
 
@@ -247,8 +276,9 @@ Steps 6–9 are your four architectural beats: **connectors extensible**, **queu
 - **Why SCIM:** Entra speaks it natively; zero IdP-side code per new tenant.
 - **Why a canonical user:** N IdPs × M apps becomes N + M integrations.
 - **Why audit in a DB, not logs:** queryable, joinable, one endpoint answers "what did we send to Jira for user X."
-- **Why a `JobQueue` for a sync v1:** the receiving concern and the processing concern have different lifecycles, failure modes, and scaling needs. The seam costs ~15 lines and means making it async later is a body change in one class. Loop now, broker later, same shape.
-- **Why retry inline today:** transient HTTP failures are the 90% case; in-process backoff handles them. A broker is for *durability across restarts* — the reason to swap `JobQueue`'s body.
+- **Why a `JobQueue`:** receiving and processing have different lifecycles, failure modes, and scaling needs. The route returns 201 in milliseconds; the worker grinds through retries against flaky downstreams in the background. Today the worker is an in-process task; tomorrow it's a worker process behind Redis. Same `submit(job)` signature.
+- **Why parallel connector fan-out (`asyncio.gather`):** Slack and Jira are independent downstream systems. Running them sequentially would double the worst-case latency for no reason. `gather(..., return_exceptions=True)` keeps the partial-failure semantics — one connector failing doesn't cancel the other — and the test `test_connectors_run_concurrently` pins the wall-clock behavior so a future refactor can't quietly revert it.
+- **Why retry stays in-process:** transient HTTP failures are the 90% case; per-call backoff handles them. A broker is for *durability across restarts* — the reason to swap `JobQueue`'s body.
 - **Why a connector registry:** the service shouldn't know app names. Registry makes adding apps mechanical, and `test_service.py` proves it.
 - **Why SQLite:** single-tenant, append-only audit, FK queries only — no Postgres feature is needed. ORM is backend-agnostic; Postgres swap is a `DATABASE_URL` change. Deliberate cost: not demonstrating Postgres-specific features I don't need. Deliberate win: reviewers clone and run with one command.
 - **Failure mode handled:** partial provisioning. Slack succeeds, Jira fails → user + Slack remote_id stored, Jira attempt visible in `connector_calls` with `succeeded=false`. Re-`PUT` from Entra retries naturally via `external_id` lookup.

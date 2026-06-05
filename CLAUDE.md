@@ -21,10 +21,10 @@ A SCIM 2.0 provisioning service that sits between an identity provider (Microsof
 These are the load-bearing abstractions. Do not collapse them.
 
 1. **`provisioning/queue.py` — `JobQueue`**
-   The SCIM route calls `queue.submit(job)`, never `service.run(job)`. Today `submit` awaits `service.run` inline. Tomorrow it pushes to Redis and a worker calls `service.run`. **Route, service, connectors do not change** when this body changes.
+   The SCIM route calls `queue.submit(job)`, never `service.run(job)`. `submit` puts the job on an in-process `asyncio.Queue` and returns; a background worker (started by the FastAPI lifespan) pulls jobs and calls `service.run`. The route returns 201 in milliseconds; the work happens off the request path. The next swap is replacing the in-process queue with Redis/SQS — same `submit(job)` signature; **route, service, connectors do not change**.
 
 2. **`connectors/registry.py` — `ConnectorRegistry`**
-   `ProvisioningService.run` iterates `registry.enabled()` and never names a connector. `main.py` is the only file that knows Slack/Jira/etc. exist. Adding a connector = one new file in `connectors/` + one `registry.register(...)` line in `main.py`. Untouched: SCIM API, queue, service, retry, audit schema, canonical model.
+   `ProvisioningService.run` iterates `registry.enabled()` and never names a connector. Connectors run **concurrently** via `asyncio.gather` — Slack and Jira make their HTTP calls at the same time, each with its own retries. `main.py` is the only file that knows Slack/Jira/etc. exist. Adding a connector = one new file in `connectors/` + one `registry.register(...)` line in `main.py`. Untouched: SCIM API, queue, service, retry, audit schema, canonical model.
 
 `tests/test_service.py` registers a fake connector at runtime and asserts the service handles it identically — that test is the proof of the extensibility claim, not the docs.
 

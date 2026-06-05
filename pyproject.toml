@@ -20,6 +20,10 @@ dev = [
     "pytest-asyncio>=0.24",
     "respx>=0.21",
     "ruff>=0.7",
+    # Drives FastAPI lifespan from ASGITransport in tests so the JobQueue
+    # background worker actually starts. Without this, tests using the
+    # `client` fixture get an unstarted worker and submitted jobs hang.
+    "asgi-lifespan>=2.1",
 ]
 
 [build-system]

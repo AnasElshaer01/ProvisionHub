@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     zendesk_subdomain: str = ""
     zendesk_email: str = ""
     zendesk_api_token: str = ""
+    zendesk_org_id: str = ""
 
 
 settings = Settings()
