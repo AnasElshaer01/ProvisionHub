@@ -38,3 +38,10 @@ provisionhub.db-shm
 *.sqlite3
 .env
 .env.local
+
+# Internal docs (keep README.md and PRESENTATION.md)
+REHEARSAL.md
+PLAN.md
+STATE.md
+DECISIONS.md
+CLAUDE.md
