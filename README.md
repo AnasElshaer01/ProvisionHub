@@ -1,6 +1,6 @@
 # ProvisionHub
 
-A SCIM 2.0 provisioning service between Microsoft Entra ID and downstream business apps (Slack, Jira).
+> **A resilient, asynchronous SCIM 2.0 provisioning engine that bridges enterprise Identity Providers (Microsoft Entra ID) with downstream SaaS platforms (Jira Cloud, Zendesk) — featuring decoupled background queues, pluggable connectors, and complete audit traceability.**
 
 ---
 
@@ -32,8 +32,8 @@ Entra ID ─SCIM─▶ FastAPI ─▶ JobQueue.submit ─▶ ProvisioningService
                                                      │
                                                      ▼
                                             ConnectorRegistry
-                                              ├─ Slack
-                                              └─ Jira
+                                              ├─ Jira
+                                              └─ Zendesk
 ```
 
 - **`JobQueue`** is the seam between *receiving* and *processing*. v1 runs jobs inline; v2 pushes to a broker. Body change in one file.
