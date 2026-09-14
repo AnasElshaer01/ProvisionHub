@@ -2,9 +2,6 @@
 
 A SCIM 2.0 provisioning service between Microsoft Entra ID and downstream business apps (Slack, Jira).
 
-> See **[PLAN.md](./PLAN.md)** for the full design, two-day schedule, and interview talking points.
-> See **[CLAUDE.md](./CLAUDE.md)** for repo conventions and editing rules.
-
 ---
 
 ## Quick Start
